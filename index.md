@@ -2,7 +2,7 @@
 layout: default
 ---
 
-# Independent Projects
+# Projects
 ## [Tetris](https://github.com/acarcher/tetris")
 Tetris clone for terminals
 
