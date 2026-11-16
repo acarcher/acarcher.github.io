@@ -231,27 +231,34 @@ footer { max-width: 1200px; margin: 0 auto; padding: 96px 32px 48px; color: var(
 <script>
 (function () {
   var canvas = document.getElementById('sorter');
-  var ctx = canvas.getContext('2d');
   var hero = canvas.parentElement;
   var still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  var wires = document.createElement('canvas');
-  var wctx = wires.getContext('2d');
   var MAIN = [255, 148, 38], ALT = [94, 231, 255];
+
+  // Static wires live on their own 2D canvas underneath; only pulses redraw each frame.
+  var wires = document.createElement('canvas');
+  wires.setAttribute('aria-hidden', 'true');
+  wires.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block';
+  hero.insertBefore(wires, canvas);
+  var wctx = wires.getContext('2d');
 
   var W = 0, H = 0, dpr = 1, gap = 34, lanes = [], links = [], pulses = [];
   var pointer = { x: -9999, y: -9999 };
   var running = true, last = 0;
+  var renderer = makeGL(canvas) || make2D(canvas);
 
   function rand(a, b) { return a + Math.random() * (b - a); }
   function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
-  function mix(a, b, t) { return [0, 1, 2].map(function (i) { return Math.round(a[i] + (b[i] - a[i]) * t); }); }
+  function mix(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
+
+  /* ---------- simulation ---------- */
 
   function layout() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = hero.clientWidth; H = hero.clientHeight;
-    [canvas, wires].forEach(function (c) { c.width = W * dpr; c.height = H * dpr; });
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    wires.width = W * dpr; wires.height = H * dpr;
     wctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    renderer.resize(W, H, dpr);
     var small = W < 560;
     gap = small ? 28 : 34;
     var n = Math.floor((H - 30) / gap);
@@ -278,8 +285,7 @@ footer { max-width: 1200px; margin: 0 auto; padding: 96px 32px 48px; color: var(
 
   function drawWires() {
     wctx.clearRect(0, 0, W, H);
-    var pass = [[4, .04], [1, .15]];   // soft glow, then the wire itself
-    pass.forEach(function (p) {
+    [[4, .04], [1, .15]].forEach(function (p) {   // soft glow, then the wire itself
       wctx.lineWidth = p[0];
       wctx.strokeStyle = rgba(MAIN, p[1]);
       wctx.beginPath();
@@ -339,48 +345,187 @@ footer { max-width: 1200px; margin: 0 auto; padding: 96px 32px 48px; color: var(
       }
       p.heat = Math.max(0, p.heat - dt * .7);
 
-      var tail = p.trail[p.trail.length - 1];
-      if (!tail || Math.abs(tail.x - p.x) + Math.abs(tail.y - p.y) >= 3) p.trail.push({ x: p.x, y: p.y });
+      var tr = p.trail, tail = tr[tr.length - 1];
+      if (!tail || Math.abs(tail.x - p.x) + Math.abs(tail.y - p.y) >= 3) tr.push({ x: p.x, y: p.y });
       var keep = Math.ceil(p.len / 3);
-      if (p.trail.length > keep) p.trail.splice(0, p.trail.length - keep);
+      if (tr.length > keep) tr.splice(0, tr.length - keep);
 
       if (p.x - p.len > W) pulses[i] = spawn(-rand(0, 300));
     }
   }
 
-  function draw() {
-    ctx.clearRect(0, 0, W, H);
-    ctx.drawImage(wires, 0, 0, W, H);
-    ctx.globalCompositeOperation = 'lighter';
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    for (var i = 0; i < pulses.length; i++) {
-      var p = pulses[i], tr = p.trail;
-      if (tr.length < 2) continue;
-      var c = p.flag ? ALT : mix(MAIN, ALT, p.heat);
-      var a = tr[0], b = tr[tr.length - 1];
-      var g = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
-      g.addColorStop(0, rgba(c, 0));
-      g.addColorStop(1, rgba(c, 1));
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      for (var k = 1; k < tr.length; k++) ctx.lineTo(tr[k].x, tr[k].y);
-      ctx.strokeStyle = g;
-      ctx.globalAlpha = .22; ctx.lineWidth = 6; ctx.stroke();
-      ctx.globalAlpha = .95; ctx.lineWidth = 1.6; ctx.stroke();
-      // bright head
-      ctx.globalAlpha = .35; ctx.fillStyle = rgba(c, 1);
-      ctx.beginPath(); ctx.arc(b.x, b.y, 4.5, 0, 6.283); ctx.fill();
-      ctx.globalAlpha = 1; ctx.fillStyle = 'rgba(255,241,222,1)';
-      ctx.fillRect(b.x - 1.5, b.y - 1.5, 3, 3);
+  function color(p) { return p.flag ? ALT : mix(MAIN, ALT, p.heat); }
+
+  /* ---------- WebGL renderer: one draw call for every trail ---------- */
+
+  function makeGL(cv) {
+    var gl = cv.getContext('webgl', { premultipliedAlpha: true, antialias: false, alpha: true });
+    if (!gl) return null;
+
+    function program(vs, fs) {
+      var p = gl.createProgram();
+      [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]].forEach(function (s) {
+        var sh = gl.createShader(s[0]); gl.shaderSource(sh, s[1]); gl.compileShader(sh); gl.attachShader(p, sh);
+      });
+      gl.linkProgram(p);
+      return gl.getProgramParameter(p, gl.LINK_STATUS) ? p : null;
     }
-    ctx.globalAlpha = 1;
-    ctx.globalCompositeOperation = 'source-over';
+
+    // Trails: a strip of quads along the trail; the shader turns the distance from
+    // the centre line into a bright core plus a soft glow, faded toward the tail.
+    var trailProg = program(
+      'attribute vec2 a_pos; attribute vec2 a_ts; attribute vec3 a_col;' +
+      'uniform vec2 u_res; varying vec2 v_ts; varying vec3 v_col;' +
+      'void main(){ vec2 c = a_pos / u_res * 2.0 - 1.0; gl_Position = vec4(c.x, -c.y, 0.0, 1.0); v_ts = a_ts; v_col = a_col; }',
+      'precision mediump float; varying vec2 v_ts; varying vec3 v_col; uniform float u_w;' +
+      'void main(){ float d = abs(v_ts.y) * u_w;' +
+      ' float core = 1.0 - smoothstep(0.4, 1.2, d);' +
+      ' float glow = exp(-d * d / 7.0) * 0.42;' +
+      ' float fade = pow(v_ts.x, 1.6);' +
+      ' vec3 c = (v_col * glow + mix(v_col, vec3(1.0, 0.95, 0.88), 0.3) * core) * fade;' +
+      ' gl_FragColor = vec4(c, max(c.r, max(c.g, c.b))); }');
+
+    // Heads: soft round points with a hot centre.
+    var headProg = program(
+      'attribute vec2 a_pos; attribute vec3 a_col; uniform vec2 u_res; uniform float u_size; varying vec3 v_col;' +
+      'void main(){ vec2 c = a_pos / u_res * 2.0 - 1.0; gl_Position = vec4(c.x, -c.y, 0.0, 1.0); gl_PointSize = u_size; v_col = a_col; }',
+      'precision mediump float; varying vec3 v_col;' +
+      'void main(){ float d = length(gl_PointCoord * 2.0 - 1.0) * 6.0;' +
+      ' float core = 1.0 - smoothstep(1.0, 2.0, d); float glow = exp(-d * d / 5.0) * 0.55;' +
+      ' vec3 c = v_col * glow + mix(v_col, vec3(1.0, 0.96, 0.9), 0.75) * core;' +
+      ' gl_FragColor = vec4(c, max(c.r, max(c.g, c.b))); }');
+
+    if (!trailProg || !headProg) return null;
+
+    var HALF = 5;                       // half-width of a trail quad, in CSS px
+    var STRIDE = 7;                     // x, y, t, s, r, g, b
+    var tBuf = gl.createBuffer(), hBuf = gl.createBuffer();
+    var tData = new Float32Array(1 << 16), hData = new Float32Array(1024);
+    var cssW = 1, cssH = 1, ratio = 1;
+
+    var tLoc = {
+      pos: gl.getAttribLocation(trailProg, 'a_pos'), ts: gl.getAttribLocation(trailProg, 'a_ts'),
+      col: gl.getAttribLocation(trailProg, 'a_col'),
+      res: gl.getUniformLocation(trailProg, 'u_res'), w: gl.getUniformLocation(trailProg, 'u_w')
+    };
+    var hLoc = {
+      pos: gl.getAttribLocation(headProg, 'a_pos'), col: gl.getAttribLocation(headProg, 'a_col'),
+      res: gl.getUniformLocation(headProg, 'u_res'), size: gl.getUniformLocation(headProg, 'u_size')
+    };
+
+    function grow(arr, need) {
+      if (need <= arr.length) return arr;
+      var n = arr.length; while (n < need) n *= 2;
+      return new Float32Array(n);
+    }
+
+    function put(o, x, y, t, s, c) {
+      tData[o] = x; tData[o + 1] = y; tData[o + 2] = t; tData[o + 3] = s;
+      tData[o + 4] = c[0] / 255; tData[o + 5] = c[1] / 255; tData[o + 6] = c[2] / 255;
+      return o + STRIDE;
+    }
+
+    return {
+      resize: function (w, h, d) {
+        cssW = w; cssH = h; ratio = d;
+        cv.width = Math.round(w * d); cv.height = Math.round(h * d);
+        gl.viewport(0, 0, cv.width, cv.height);
+      },
+      draw: function () {
+        // build vertices: 6 per trail segment, using per-point normals so bends join cleanly
+        var need = 0;
+        for (var i = 0; i < pulses.length; i++) need += Math.max(0, pulses[i].trail.length - 1) * 6 * STRIDE;
+        tData = grow(tData, need);
+        hData = grow(hData, pulses.length * 5);
+        var o = 0, h = 0;
+        for (i = 0; i < pulses.length; i++) {
+          var p = pulses[i], tr = p.trail, n = tr.length;
+          if (n < 2) continue;
+          var c = color(p);
+          var nx = [], ny = [];
+          for (var k = 0; k < n; k++) {
+            var a = tr[Math.max(0, k - 1)], b = tr[Math.min(n - 1, k + 1)];
+            var dx = b.x - a.x, dy = b.y - a.y, len = Math.sqrt(dx * dx + dy * dy) || 1;
+            nx.push(-dy / len * HALF); ny.push(dx / len * HALF);
+          }
+          for (k = 0; k < n - 1; k++) {
+            var p0 = tr[k], p1 = tr[k + 1], t0 = k / (n - 1), t1 = (k + 1) / (n - 1);
+            var ax = p0.x + nx[k], ay = p0.y + ny[k], bx = p0.x - nx[k], by = p0.y - ny[k];
+            var cx = p1.x + nx[k + 1], cy = p1.y + ny[k + 1], ex = p1.x - nx[k + 1], ey = p1.y - ny[k + 1];
+            o = put(o, ax, ay, t0, 1, c); o = put(o, bx, by, t0, -1, c); o = put(o, cx, cy, t1, 1, c);
+            o = put(o, cx, cy, t1, 1, c); o = put(o, bx, by, t0, -1, c); o = put(o, ex, ey, t1, -1, c);
+          }
+          var hd = tr[n - 1];
+          hData[h] = hd.x; hData[h + 1] = hd.y; hData[h + 2] = c[0] / 255; hData[h + 3] = c[1] / 255; hData[h + 4] = c[2] / 255;
+          h += 5;
+        }
+
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE);   // additive: overlapping light adds up
+
+        gl.useProgram(trailProg);
+        gl.uniform2f(tLoc.res, cssW, cssH);
+        gl.uniform1f(tLoc.w, HALF);
+        gl.bindBuffer(gl.ARRAY_BUFFER, tBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, tData.subarray(0, o), gl.DYNAMIC_DRAW);
+        var F = 4;
+        gl.enableVertexAttribArray(tLoc.pos); gl.vertexAttribPointer(tLoc.pos, 2, gl.FLOAT, false, STRIDE * F, 0);
+        gl.enableVertexAttribArray(tLoc.ts); gl.vertexAttribPointer(tLoc.ts, 2, gl.FLOAT, false, STRIDE * F, 2 * F);
+        gl.enableVertexAttribArray(tLoc.col); gl.vertexAttribPointer(tLoc.col, 3, gl.FLOAT, false, STRIDE * F, 4 * F);
+        gl.drawArrays(gl.TRIANGLES, 0, o / STRIDE);
+        gl.disableVertexAttribArray(tLoc.ts);
+
+        gl.useProgram(headProg);
+        gl.uniform2f(hLoc.res, cssW, cssH);
+        gl.uniform1f(hLoc.size, 12 * ratio);
+        gl.bindBuffer(gl.ARRAY_BUFFER, hBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, hData.subarray(0, h), gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(hLoc.pos); gl.vertexAttribPointer(hLoc.pos, 2, gl.FLOAT, false, 5 * F, 0);
+        gl.enableVertexAttribArray(hLoc.col); gl.vertexAttribPointer(hLoc.col, 3, gl.FLOAT, false, 5 * F, 2 * F);
+        gl.drawArrays(gl.POINTS, 0, h / 5);
+      }
+    };
   }
+
+  /* ---------- 2D fallback for browsers without WebGL ---------- */
+
+  function make2D(cv) {
+    var ctx = cv.getContext('2d');
+    return {
+      resize: function (w, h, d) { cv.width = w * d; cv.height = h * d; ctx.setTransform(d, 0, 0, d, 0, 0); },
+      draw: function () {
+        ctx.clearRect(0, 0, W, H);
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        for (var i = 0; i < pulses.length; i++) {
+          var p = pulses[i], tr = p.trail;
+          if (tr.length < 2) continue;
+          var c = color(p).map(Math.round);
+          var a = tr[0], b = tr[tr.length - 1];
+          var g = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+          g.addColorStop(0, rgba(c, 0)); g.addColorStop(1, rgba(c, 1));
+          ctx.beginPath(); ctx.moveTo(a.x, a.y);
+          for (var k = 1; k < tr.length; k++) ctx.lineTo(tr[k].x, tr[k].y);
+          ctx.strokeStyle = g;
+          ctx.globalAlpha = .22; ctx.lineWidth = 6; ctx.stroke();
+          ctx.globalAlpha = .95; ctx.lineWidth = 1.6; ctx.stroke();
+          ctx.globalAlpha = 1; ctx.fillStyle = 'rgba(255,241,222,1)';
+          ctx.fillRect(b.x - 1.5, b.y - 1.5, 3, 3);
+        }
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+      }
+    };
+  }
+
+  /* ---------- loop and input ---------- */
 
   function frame(t) {
     if (!running) return;
     var dt = Math.min(.05, (t - last) / 1000 || 0); last = t;
-    step(dt); draw();
+    step(dt); renderer.draw();
     requestAnimationFrame(frame);
   }
 
@@ -397,11 +542,11 @@ footer { max-width: 1200px; margin: 0 auto; padding: 96px 32px 48px; color: var(
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(function () {
       if (hero.clientWidth === lastW) return;   // ignore mobile URL-bar height changes
-      lastW = hero.clientWidth; layout(); draw();
+      lastW = hero.clientWidth; layout(); renderer.draw();
     }, 150);
   });
 
-  layout(); lastW = W; draw();
+  layout(); lastW = W; renderer.draw();
   if (still) return;
   if ('IntersectionObserver' in window) {
     new IntersectionObserver(function (entries) {
