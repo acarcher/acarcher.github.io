@@ -45,7 +45,11 @@ a:hover { color: var(--accent); text-decoration-color: currentColor; }
   border-bottom: 1px solid var(--line);
   overflow: hidden;
   touch-action: pan-y;
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
 }
+.hero a { -webkit-touch-callout: default; }
 #sorter { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .hero .inner {
   position: absolute; left: 0; right: 0; bottom: 0;
@@ -536,6 +540,8 @@ footer { max-width: 1200px; margin: 0 auto; padding: 96px 32px 48px; color: var(
   hero.addEventListener('pointermove', setPointer);
   hero.addEventListener('pointerdown', setPointer);
   hero.addEventListener('pointerleave', function () { pointer.x = pointer.y = -9999; });
+  // long-press on the hero shouldn't open a copy menu (the link keeps its own)
+  hero.addEventListener('contextmenu', function (e) { if (!e.target.closest('a')) e.preventDefault(); });
 
   var resizeTimer, lastW = 0;
   window.addEventListener('resize', function () {
